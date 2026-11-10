@@ -1,0 +1,19 @@
+[Unit]
+Description=Phone Screen MCP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=phone-mcp
+Group=phone-mcp
+WorkingDirectory=/opt/phone-screen-mcp
+EnvironmentFile=/opt/phone-screen-mcp/.env
+ExecStart=/opt/phone-screen-mcp/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 18770
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
