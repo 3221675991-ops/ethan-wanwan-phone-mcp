@@ -3,11 +3,14 @@
 import hmac
 import json
 import os
+import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from threading import Lock
 from zoneinfo import ZoneInfo
 
 from PIL import Image as PILImage
@@ -17,17 +20,22 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 
+VERSION = "2.1.0"
 DATA = Path(os.getenv("PHONE_MCP_DATA_DIR", "./data")).expanduser().resolve()
 LATEST = DATA / "latest.jpg"
 STATE = DATA / "state.json"
 LOG = DATA / "app-usage.jsonl"
 COMMAND = DATA / "command.json"
+ACK = DATA / "ack.json"
+HEARTBEAT = DATA / "heartbeat.json"
 SCREEN_TIME = DATA / "screen-time.json"
 TOKEN = os.environ["PHONE_UPLOAD_TOKEN"].strip()
 TZ = ZoneInfo(os.getenv("PHONE_MCP_TIMEZONE", "Asia/Shanghai"))
 HOST = os.getenv("PHONE_MCP_HOST", "127.0.0.1")
 PORT = int(os.getenv("PHONE_MCP_PORT", "18770"))
 BARK_PUSH_URL = os.getenv("BARK_PUSH_URL", "").strip()
+HEARTBEAT_TIMEOUT = max(15, int(os.getenv("HEARTBEAT_TIMEOUT", "90")))
+COMMAND_LOCK = Lock()
 
 if not TOKEN:
     raise RuntimeError("PHONE_UPLOAD_TOKEN must not be empty")
@@ -39,7 +47,8 @@ mcp = FastMCP(
     instructions=(
         "Read the latest uploaded phone screenshot, app activity and screen time; "
         "send whole-session lock or unlock commands to an iOS Shortcut; "
-        "request a consent-gated fresh screenshot by sending a Bark notification."
+        "request a consent-gated fresh screenshot by sending a Bark notification; "
+        "inspect phone heartbeat, command delivery and acknowledgements."
     ),
     host=HOST,
     port=PORT,
@@ -49,6 +58,10 @@ mcp = FastMCP(
 
 def now() -> str:
     return datetime.now(TZ).isoformat(timespec="seconds")
+
+
+def now_ts() -> float:
+    return time.time()
 
 
 def authorized(request: Request) -> bool:
@@ -96,20 +109,53 @@ def read_state() -> dict:
     return value if isinstance(value, dict) else {"current_app": None, "updated_at": None}
 
 
+def update_heartbeat() -> dict:
+    heartbeat = {"last_seen": now(), "last_seen_ts": now_ts()}
+    write_json_atomic(HEARTBEAT, heartbeat)
+    return heartbeat
+
+
+def phone_health() -> dict:
+    heartbeat = read_json(HEARTBEAT, {})
+    if not isinstance(heartbeat, dict) or "last_seen_ts" not in heartbeat:
+        return {
+            "alive": False,
+            "last_seen": None,
+            "silence_seconds": None,
+            "timeout_threshold": HEARTBEAT_TIMEOUT,
+        }
+    try:
+        elapsed = max(0, round(now_ts() - float(heartbeat["last_seen_ts"])))
+    except (TypeError, ValueError):
+        elapsed = None
+    alive = elapsed is not None and elapsed < HEARTBEAT_TIMEOUT
+    return {
+        "alive": alive,
+        "last_seen": heartbeat.get("last_seen"),
+        "silence_seconds": elapsed,
+        "timeout_threshold": HEARTBEAT_TIMEOUT,
+    }
+
+
+def command_snapshot() -> dict | None:
+    value = read_json(COMMAND, None)
+    return value if isinstance(value, dict) else None
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_: Request):
-    return JSONResponse({"ok": True, "time": now()})
+    return JSONResponse({
+        "ok": True, "version": VERSION, "time": now(), "phone": phone_health()
+    })
 
 
 @mcp.custom_route("/upload", methods=["POST"])
 async def upload_screen(request: Request):
     if not authorized(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-
     body = await request.body()
     if not body or len(body) > 20 * 1024 * 1024:
         return JSONResponse({"error": "invalid image size"}, status_code=400)
-
     try:
         image = PILImage.open(BytesIO(body))
         image.verify()
@@ -119,7 +165,7 @@ async def upload_screen(request: Request):
         temporary.replace(LATEST)
     except Exception:
         return JSONResponse({"error": "invalid image"}, status_code=400)
-
+    update_heartbeat()
     state = read_state()
     state["screenshot_at"] = now()
     write_json_atomic(STATE, state)
@@ -130,7 +176,6 @@ async def upload_screen(request: Request):
 async def record_app_event(request: Request):
     if not authorized(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-
     try:
         payload = await request.json()
         app_name = str(payload["app"]).strip()[:100]
@@ -139,28 +184,21 @@ async def record_app_event(request: Request):
             raise ValueError
     except Exception:
         return JSONResponse({"error": "invalid event"}, status_code=400)
-
+    update_heartbeat()
     timestamp = now()
     state = read_state()
-    state.update(
-        {
-            "current_app": app_name if event == "open" else None,
-            "last_app": app_name,
-            "last_event": event,
-            "updated_at": timestamp,
-        }
-    )
+    state.update({
+        "current_app": app_name if event == "open" else None,
+        "last_app": app_name,
+        "last_event": event,
+        "updated_at": timestamp,
+    })
     write_json_atomic(STATE, state)
-
     with LOG.open("a", encoding="utf-8") as file:
-        file.write(
-            json.dumps(
-                {"app": app_name, "event": event, "time": timestamp},
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
-
+        file.write(json.dumps(
+            {"app": app_name, "event": event, "time": timestamp},
+            ensure_ascii=False,
+        ) + "\n")
     return JSONResponse({"ok": True, "time": timestamp})
 
 
@@ -168,29 +206,44 @@ async def record_app_event(request: Request):
 async def upload_today_screen_time(request: Request):
     if not authorized(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-
     body = await request.body()
     if not body or len(body) > 64 * 1024:
         return JSONResponse({"error": "invalid screen time payload"}, status_code=400)
-
     try:
         payload = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
         try:
             payload = {"raw": body.decode("utf-8").strip()}
         except UnicodeDecodeError:
-            return JSONResponse(
-                {"error": "invalid screen time payload"}, status_code=400
-            )
-
+            return JSONResponse({"error": "invalid screen time payload"}, status_code=400)
+    update_heartbeat()
     record = {"screen_time": payload, "updated_at": now()}
     write_json_atomic(SCREEN_TIME, record)
     return JSONResponse({"ok": True, "updated_at": record["updated_at"]})
 
 
 def set_phone_command(command: str) -> dict:
-    data = {"command": command, "created_at": now()}
-    write_json_atomic(COMMAND, data)
+    """Queue one command; never overwrite an unacknowledged command."""
+    with COMMAND_LOCK:
+        pending = command_snapshot()
+        if pending and pending.get("command") not in (None, "none"):
+            return {
+                "ok": False,
+                "error": "command_pending",
+                "message": "An earlier phone command is still awaiting acknowledgement.",
+                "pending_command": pending,
+            }
+        timestamp = now()
+        data = {
+            "command": command,
+            "id": uuid.uuid4().hex,
+            "created_at": timestamp,
+            "created_ts": now_ts(),
+            "delivered": False,
+            "delivery_count": 0,
+            "attempts": 0,
+        }
+        write_json_atomic(COMMAND, data)
     return {"ok": True, **data}
 
 
@@ -198,17 +251,72 @@ def set_phone_command(command: str) -> dict:
 async def get_phone_command(request: Request):
     if not authorized(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    if not COMMAND.exists():
-        return JSONResponse({"command": "none"})
+    update_heartbeat()
+    with COMMAND_LOCK:
+        data = command_snapshot()
+        if not data or data.get("command") in (None, "none"):
+            return JSONResponse({"command": "none"})
+        # Migrate a command created by the pre-ACK version without losing it.
+        data.setdefault("id", uuid.uuid4().hex)
+        data.setdefault("created_at", now())
+        data.setdefault("created_ts", now_ts())
+        data.setdefault("delivery_count", 0)
+        data.setdefault("attempts", 0)
+        data["delivered"] = True
+        data["delivery_count"] = int(data.get("delivery_count", 0)) + 1
+        data["last_delivered_at"] = now()
+        data["last_delivered_ts"] = now_ts()
+        write_json_atomic(COMMAND, data)
+    return JSONResponse(data)
 
-    data = read_json(COMMAND, {"command": "none"})
-    COMMAND.unlink(missing_ok=True)
-    return JSONResponse(data if isinstance(data, dict) else {"command": "none"})
+
+@mcp.custom_route("/ack", methods=["POST"])
+async def acknowledge_phone_command(request: Request):
+    if not authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        payload = await request.json()
+        command_id = str(payload["command_id"]).strip()
+        status = str(payload.get("status", "done")).strip().lower()
+        error = str(payload.get("error", "")).strip()[:500]
+        if not command_id or status not in {"done", "failed"}:
+            raise ValueError
+    except Exception:
+        return JSONResponse({"error": "invalid acknowledgement"}, status_code=400)
+    update_heartbeat()
+    with COMMAND_LOCK:
+        current = command_snapshot()
+        previous_ack = read_json(ACK, None)
+        if not current or current.get("id") != command_id:
+            if (
+                isinstance(previous_ack, dict)
+                and previous_ack.get("command_id") == command_id
+                and previous_ack.get("status") == status
+            ):
+                return JSONResponse({"ok": True, "duplicate": True, **previous_ack})
+            return JSONResponse({"error": "command_id_mismatch"}, status_code=409)
+        acknowledgement = {
+            "command_id": command_id,
+            "command": current.get("command"),
+            "status": status,
+            "acked_at": now(),
+            "error": error or None,
+        }
+        write_json_atomic(ACK, acknowledgement)
+        if status == "done":
+            COMMAND.unlink(missing_ok=True)
+        else:
+            current["delivered"] = False
+            current["attempts"] = int(current.get("attempts", 0)) + 1
+            current["last_error"] = error or "Phone reported command failure"
+            current["last_failed_at"] = now()
+            write_json_atomic(COMMAND, current)
+    return JSONResponse({"ok": True, **acknowledgement})
 
 
 @mcp.tool()
 def get_latest_screen() -> Image:
-    """Return the latest screenshot uploaded by the phone."""
+    """Return the latest screenshot uploaded by the phone after owner consent."""
     if not LATEST.exists():
         raise RuntimeError("The phone has not uploaded a screenshot yet")
     return Image(path=str(LATEST))
@@ -216,8 +324,10 @@ def get_latest_screen() -> Image:
 
 @mcp.tool()
 def get_phone_status() -> dict:
-    """Return the current app, last app event and latest screenshot time."""
-    return read_state()
+    """Return current app, last event, screenshot time and phone heartbeat."""
+    state = read_state()
+    state["phone"] = phone_health()
+    return state
 
 
 @mcp.tool()
@@ -262,35 +372,27 @@ def send_bark_notification(title: str, body: str) -> dict:
     """Send one Bark notification without exposing the private push URL."""
     if not BARK_PUSH_URL:
         raise RuntimeError("BARK_PUSH_URL is not configured on the server")
-
-    payload = json.dumps(
-        {
-            "title": title,
-            "body": body,
-            "group": "ethan-wanwan-screen",
-            "level": "active",
-            "action": "none",
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
-
-    request = urllib.request.Request(
+    payload = json.dumps({
+        "title": title,
+        "body": body,
+        "group": "ethan-wanwan-screen",
+        "level": "active",
+        "action": "none",
+    }, ensure_ascii=False).encode("utf-8")
+    push_request = urllib.request.Request(
         BARK_PUSH_URL,
         data=payload,
         headers={"Content-Type": "application/json; charset=utf-8"},
         method="POST",
     )
-
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(push_request, timeout=10) as response:
             response.read(64 * 1024)
             status = int(getattr(response, "status", 200))
     except (urllib.error.URLError, OSError) as exc:
         raise RuntimeError("Bark push failed") from exc
-
     if not 200 <= status < 300:
         raise RuntimeError(f"Bark push failed with HTTP {status}")
-
     return {"ok": True, "provider": "bark", "sent_at": now()}
 
 
@@ -306,20 +408,60 @@ def request_screenshot() -> dict:
         "Ethan 想看看晚晚现在在干嘛",
         "允许获取一次当前屏幕截图吗？只有你确认后才会截图并上传。",
     )
-    return {
-        **sent,
-        "consent_required": True,
-        "queued_phone_command": False,
-    }
+    return {**sent, "consent_required": True, "queued_phone_command": False}
 
 
 @mcp.tool()
 def get_phone_control_status() -> dict:
-    """Return the command waiting for the phone, if any."""
-    value = read_json(COMMAND, None)
-    if not isinstance(value, dict):
-        return {"command": "none", "pending": False}
-    return {"pending": True, **value}
+    """Return the command waiting for the phone and its last acknowledgement."""
+    pending = command_snapshot()
+    last_ack = read_json(ACK, None)
+    return {
+        "pending": bool(pending and pending.get("command") not in (None, "none")),
+        "command": pending.get("command", "none") if pending else "none",
+        "pending_command": pending,
+        "last_ack": last_ack if isinstance(last_ack, dict) else None,
+    }
+
+
+@mcp.tool()
+def watchdog_health() -> dict:
+    """Return server, phone heartbeat, screenshot freshness and command ACK status."""
+    phone = phone_health()
+    state = read_state()
+    pending = command_snapshot()
+    last_ack = read_json(ACK, None)
+    screen_time = read_json(SCREEN_TIME, None)
+    pending_summary = None
+    if pending and pending.get("command") not in (None, "none"):
+        try:
+            age = max(0, round(now_ts() - float(pending.get("created_ts", now_ts()))))
+        except (TypeError, ValueError):
+            age = None
+        pending_summary = {
+            "command": pending.get("command"),
+            "id": pending.get("id"),
+            "created_at": pending.get("created_at"),
+            "delivered": bool(pending.get("delivered")),
+            "delivery_count": int(pending.get("delivery_count", 0)),
+            "attempts": int(pending.get("attempts", 0)),
+            "age_seconds": age,
+            "stuck": age is not None and age > HEARTBEAT_TIMEOUT and (
+                not phone["alive"] or bool(pending.get("delivered"))
+            ),
+            "last_error": pending.get("last_error"),
+        }
+    return {
+        "server": {"ok": True, "version": VERSION, "time": now()},
+        "phone": phone,
+        "screenshot": {"exists": LATEST.exists(), "taken_at": state.get("screenshot_at")},
+        "current_app": state.get("current_app"),
+        "pending_command": pending_summary,
+        "last_ack": last_ack if isinstance(last_ack, dict) else None,
+        "screen_time_updated_at": (
+            screen_time.get("updated_at") if isinstance(screen_time, dict) else None
+        ),
+    }
 
 
 app = MCPBearerAuthMiddleware(mcp.streamable_http_app())
