@@ -3,6 +3,8 @@
 import hmac
 import json
 import os
+import urllib.error
+import urllib.request
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -25,6 +27,7 @@ TOKEN = os.environ["PHONE_UPLOAD_TOKEN"].strip()
 TZ = ZoneInfo(os.getenv("PHONE_MCP_TIMEZONE", "Asia/Shanghai"))
 HOST = os.getenv("PHONE_MCP_HOST", "127.0.0.1")
 PORT = int(os.getenv("PHONE_MCP_PORT", "18770"))
+BARK_PUSH_URL = os.getenv("BARK_PUSH_URL", "").strip()
 
 if not TOKEN:
     raise RuntimeError("PHONE_UPLOAD_TOKEN must not be empty")
@@ -35,7 +38,8 @@ mcp = FastMCP(
     "Phone Screen MCP",
     instructions=(
         "Read the latest uploaded phone screenshot, app activity and screen time; "
-        "send whole-session lock or unlock commands to an iOS Shortcut."
+        "send whole-session lock or unlock commands to an iOS Shortcut; "
+        "request a consent-gated fresh screenshot by sending a Bark notification."
     ),
     host=HOST,
     port=PORT,
@@ -254,10 +258,59 @@ def unlock_phone_apps() -> dict:
     return set_phone_command("unlock")
 
 
+def send_bark_notification(title: str, body: str) -> dict:
+    """Send one Bark notification without exposing the private push URL."""
+    if not BARK_PUSH_URL:
+        raise RuntimeError("BARK_PUSH_URL is not configured on the server")
+
+    payload = json.dumps(
+        {
+            "title": title,
+            "body": body,
+            "group": "ethan-wanwan-screen",
+            "level": "active",
+            "action": "none",
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        BARK_PUSH_URL,
+        data=payload,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read(64 * 1024)
+            status = int(getattr(response, "status", 200))
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeError("Bark push failed") from exc
+
+    if not 200 <= status < 300:
+        raise RuntimeError(f"Bark push failed with HTTP {status}")
+
+    return {"ok": True, "provider": "bark", "sent_at": now()}
+
+
 @mcp.tool()
 def request_screenshot() -> dict:
-    """Ask the phone Shortcut to capture and upload a fresh screenshot."""
-    return set_phone_command("screenshot")
+    """Ask the owner for consent before the phone captures and uploads a screenshot.
+
+    This tool only sends a Bark notification. It never queues a screenshot command.
+    The iPhone notification automation must receive the owner's confirmation before
+    its Shortcut captures the screen and uploads it through the existing /upload route.
+    """
+    sent = send_bark_notification(
+        "Ethan 想看看晚晚现在在干嘛",
+        "允许获取一次当前屏幕截图吗？只有你确认后才会截图并上传。",
+    )
+    return {
+        **sent,
+        "consent_required": True,
+        "queued_phone_command": False,
+    }
 
 
 @mcp.tool()
