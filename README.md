@@ -7,7 +7,8 @@
 - 接收并读取手机截图；
 - 记录 App 打开/关闭事件；
 - 接收并读取 Jomo 的今日屏幕使用时长；
-- 下发整组 `lock` / `unlock` 命令，由手机快捷指令启动或停止一个预先配置好的 Jomo Session。
+- 下发整组 `lock` / `unlock` 命令，由手机快捷指令启动或停止一个预先配置好的 Jomo Session；
+- 通过 Bark 发起“请求截图”，由 iPhone 的通知自动化在用户确认后才截屏并上传。
 
 项目不会直接绕过 iOS 权限，也不会在服务器上控制 App。真正的锁定动作始终由手机上的快捷指令与 Jomo 执行。
 
@@ -21,6 +22,7 @@
 2. MCP 客户端通过工具读取服务器保存的状态。
 3. MCP 客户端调用 `lock_phone_apps` 或 `unlock_phone_apps`。
 4. 手机上的轮询快捷指令读取 `/command`，再调用 Jomo 的 Start Session / Stop Session。
+5. `request_screenshot` 不写入 `/command`；它只发送 Bark 通知。iOS 27 的“收到 Bark 通知”自动化在用户确认后运行截图上传快捷指令。
 
 ## 服务端安装
 
@@ -74,6 +76,7 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 export PHONE_UPLOAD_TOKEN='替换为随机长 Token'
 export PHONE_MCP_DATA_DIR="$PWD/data"
+export BARK_PUSH_URL='https://api.day.app/你的BarkKey'
 .venv/bin/uvicorn server:app --host 127.0.0.1 --port 18770
 ```
 
@@ -84,6 +87,7 @@ py -3.11 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 $env:PHONE_UPLOAD_TOKEN = "替换为随机长 Token"
 $env:PHONE_MCP_DATA_DIR = "$PWD\data"
+$env:BARK_PUSH_URL = "https://api.day.app/你的BarkKey"
 .venv\Scripts\python.exe -m uvicorn server:app --host 127.0.0.1 --port 18770
 ```
 
@@ -142,7 +146,21 @@ Authorization = Bearer YOUR_TOKEN
 
 也可以直接把 Jomo 输出作为请求体发送；服务器会保存结构化 JSON 或原始文本。
 
-### 4. 执行锁定命令
+### 4. 同意后截图
+
+服务器配置 `BARK_PUSH_URL`（例如 Bark App 提供的测试 URL 中，保留到设备 Key 的部分）。MCP 调用 `request_screenshot` 时只发送一条 Bark 通知，不会直接下发截图命令。
+
+在 iOS 27 的“快捷指令”中为截图上传快捷指令添加“通知”自动化，来源选择 Bark。保持需要用户确认；确认后执行：
+
+1. 等待约 0.5 秒，让确认界面消失；
+2. “截屏”；
+3. `POST https://YOUR_DOMAIN/upload`；
+4. 请求体选“文件”，文件使用上一步截图；
+5. 继续使用原有 `Authorization: Bearer YOUR_TOKEN`。
+
+取消或不确认时，不执行截图和上传。
+
+### 5. 执行锁定命令
 
 创建一个轮询快捷指令：
 
@@ -164,6 +182,7 @@ Authorization = Bearer YOUR_TOKEN
 | `get_today_screen_time` | 读取最近上传的今日屏幕时长 |
 | `lock_phone_apps` | 下发整组锁定命令 |
 | `unlock_phone_apps` | 下发整组解锁命令 |
+| `request_screenshot` | 发送 Bark 截图请求；需用户在 iPhone 上确认后才会截图 |
 | `get_phone_control_status` | 查看是否有待执行命令 |
 
 ## 本地测试
