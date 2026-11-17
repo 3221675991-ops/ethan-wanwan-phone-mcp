@@ -92,6 +92,14 @@ async def main():
 
     assert server.unlock_phone_apps()["command"] == "unlock"
     assert server.get_phone_control_status()["pending"] is True
+    response = await server.get_phone_command(request("GET", "/command"))
+    assert json.loads(response.body)["command"] == "unlock"
+
+    assert server.request_screenshot()["command"] == "screenshot"
+    assert server.get_phone_control_status()["pending"] is True
+    response = await server.get_phone_command(request("GET", "/command"))
+    assert json.loads(response.body)["command"] == "screenshot"
+    assert not server.COMMAND.exists()
 
     payload = json.dumps({"total_minutes": 123}, ensure_ascii=False).encode()
     response = await server.upload_today_screen_time(
