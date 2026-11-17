@@ -95,11 +95,17 @@ async def main():
     response = await server.get_phone_command(request("GET", "/command"))
     assert json.loads(response.body)["command"] == "unlock"
 
-    assert server.request_screenshot()["command"] == "screenshot"
-    assert server.get_phone_control_status()["pending"] is True
-    response = await server.get_phone_command(request("GET", "/command"))
-    assert json.loads(response.body)["command"] == "screenshot"
-    assert not server.COMMAND.exists()
+    server.send_bark_notification = lambda title, body: {
+        "ok": True,
+        "provider": "bark",
+        "sent_at": server.now(),
+    }
+    screenshot_request = server.request_screenshot()
+    assert screenshot_request["ok"] is True
+    assert screenshot_request["provider"] == "bark"
+    assert screenshot_request["consent_required"] is True
+    assert screenshot_request["queued_phone_command"] is False
+    assert server.get_phone_control_status()["pending"] is False
 
     payload = json.dumps({"total_minutes": 123}, ensure_ascii=False).encode()
     response = await server.upload_today_screen_time(
