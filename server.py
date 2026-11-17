@@ -255,6 +255,12 @@ def unlock_phone_apps() -> dict:
 
 
 @mcp.tool()
+def request_screenshot() -> dict:
+    """Ask the phone Shortcut to capture and upload a fresh screenshot."""
+    return set_phone_command("screenshot")
+
+
+@mcp.tool()
 def get_phone_control_status() -> dict:
     """Return the command waiting for the phone, if any."""
     value = read_json(COMMAND, None)
